@@ -1,3 +1,4 @@
+# Python deps (Streamlit Community Cloud = Linux; keep install reliable)
 xgboost
 scikit-learn
 pandas
@@ -8,5 +9,6 @@ streamlit
 joblib
 plotly
 imbalanced-learn
-scapy
 fpdf2
+# scapy: optional (packet sniffing). Installs separately if needed: pip install scapy
+# Cloud builds often fail on scapy; app uses simulation without it.

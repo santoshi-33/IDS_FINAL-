@@ -1,0 +1,2 @@
+# Optional: only if you need live packet capture (Scapy) locally / on a full VM
+scapy
