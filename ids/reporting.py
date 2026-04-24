@@ -147,7 +147,16 @@ def try_send_email_with_pdf(
     smtp_user = (os.getenv("IDS_SMTP_USER") or "").strip()
     smtp_pass = (os.getenv("IDS_SMTP_PASS") or "").strip()
     from_addr = (os.getenv("IDS_SMTP_FROM") or smtp_user or "").strip()
-    use_tls = (os.getenv("IDS_SMTP_STARTTLS", "1").strip() not in ("0", "false", "False"))
+    ssl_mode = (os.getenv("IDS_SMTP_SSL") or "").strip().lower() in ("1", "true", "yes", "y")
+    starttls_default = (os.getenv("IDS_SMTP_STARTTLS", "1").strip() not in ("0", "false", "False"))
+
+    # Brevo commonly: 587 + STARTTLS, or 465 + implicit TLS (SMTP_SSL)
+    if smtp_port == 465:
+        use_smtp_ssl = True
+        use_starttls = False
+    else:
+        use_smtp_ssl = ssl_mode
+        use_starttls = starttls_default and not use_smtp_ssl
 
     if not smtp_host or not from_addr or not smtp_user or not smtp_pass:
         raise RuntimeError(
@@ -165,8 +174,13 @@ def try_send_email_with_pdf(
     )
 
     context = ssl.create_default_context()
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-        if use_tls:
-            server.starttls(context=context)
-        server.login(smtp_user, smtp_pass)
-        server.send_message(msg)
+    if use_smtp_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=30) as server:
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+            if use_starttls:
+                server.starttls(context=context)
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)

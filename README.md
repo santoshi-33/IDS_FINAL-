@@ -63,12 +63,26 @@ The dashboard can generate a PDF and optionally email it.
 
 Set these environment variables (or Streamlit Cloud **Secrets**):
 
-- `IDS_SMTP_HOST` (e.g. `smtp.gmail.com`)
-- `IDS_SMTP_PORT` (usually `587`)
+- `IDS_SMTP_HOST` (e.g. `smtp.gmail.com`, or Brevo `smtp-relay.brevo.com`)
+- `IDS_SMTP_PORT` (usually `587` for STARTTLS, or `465` for SSL)
 - `IDS_SMTP_USER` (your SMTP username)
 - `IDS_SMTP_PASS` (app password / SMTP password)
 - `IDS_SMTP_FROM` (the From address; often same as `IDS_SMTP_USER`)
 - `IDS_SMTP_STARTTLS` (default `1`; set `0` if your provider does not use STARTTLS)
+- `IDS_SMTP_SSL` (set `1` to force `SMTP_SSL` on non-465 ports; usually not needed)
+
+Brevo (example):
+
+```toml
+IDS_SMTP_HOST="smtp-relay.brevo.com"
+IDS_SMTP_PORT="587"
+IDS_SMTP_USER="xxxx@yourdomain.com"        # Brevo SMTP login (shown in Brevo SMTP settings)
+IDS_SMTP_PASS="YOUR_BREVO_SMTP_KEY"        # Brevo SMTP key (not your web login password)
+IDS_SMTP_FROM="xxxx@yourdomain.com"        # Must be a verified sender in Brevo
+IDS_SMTP_STARTTLS="1"
+```
+
+If you use port `465`, you typically do not need `STARTTLS` (the app will use implicit TLS automatically when port is 465).
 
 ## Data notes (NSL-KDD / CICIDS2017)
 
