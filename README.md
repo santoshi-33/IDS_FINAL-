@@ -43,11 +43,15 @@ python -m ids.train --data data/train.csv --label-col label --out models/ids_mod
 streamlit run app/streamlit_app.py
 ```
 
-Login (email + password) via env vars / Streamlit secrets:
-- `IDS_USER`: allowed login email
-- `IDS_PASS`: password
+### Login / Sign up
 
-Example:
+- **Sign up**: create an account with email + password (stored locally in `data/app_users.json` with hashed passwords).
+- **Login**: use the same email/password.
+
+Optional fixed “single user” login via env / Streamlit secrets (useful on Streamlit Cloud if you don’t want local user storage):
+
+- `IDS_USER`: email
+- `IDS_PASS`: password
 
 ```bash
 IDS_USER=you@example.com IDS_PASS=yourpass streamlit run app/streamlit_app.py

@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from ids.live import scapy_sniff_available, simulate_stream
 from ids.pipeline import predict_df
 from ids.reporting import build_ids_report_pdf, load_metrics_json, try_send_email_with_pdf
+from ids.user_store import env_bootstrap_exists, sign_up, verify_user
 
 
 APP_TITLE = "ML-based Intrusion Detection System (IDS)"
@@ -53,24 +54,54 @@ def check_login() -> bool:
     st.title(APP_TITLE)
     st.subheader("Authentication")
 
-    email = st.text_input("Email (login id)", value="", autocomplete="email")
-    pw = st.text_input("Password", value="", type="password", autocomplete="current-password")
+    tab_signup, tab_login = st.tabs(["Sign up", "Login"])
 
-    # Expected credentials are configured in Streamlit Cloud Secrets / environment variables.
-    # Recommended: set IDS_USER to the allowed email, IDS_PASS to the password.
-    expected_email = _get_env("IDS_USER", "admin@example.com")
-    expected_pw = _get_env("IDS_PASS", "admin123")
+    with tab_signup:
+        su_email = st.text_input("Email", key="su_email", autocomplete="email")
+        su_pw = st.text_input("Password", type="password", key="su_pw", autocomplete="new-password")
+        su_pw2 = st.text_input(
+            "Confirm password", type="password", key="su_pw2", autocomplete="new-password"
+        )
+        if st.button("Create account", type="primary"):
+            if not _is_valid_email(su_email):
+                st.error("Please enter a valid email address.")
+            elif su_pw != su_pw2:
+                st.error("Passwords do not match.")
+            else:
+                ok, msg = sign_up(PROJECT_ROOT, su_email, su_pw)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
 
-    if st.button("Login"):
-        if not _is_valid_email(email):
-            st.error("Please enter a valid email address.")
-        elif email.strip().lower() == expected_email.strip().lower() and pw == expected_pw:
-            st.session_state.authed = True
-            st.session_state.user_email = email.strip()
-            st.rerun()
-        else:
-            st.error("Invalid email or password.")
-    st.info("Configure allowed login in secrets/env: IDS_USER (email) and IDS_PASS.")
+    with tab_login:
+        lg_email = st.text_input("Email", key="lg_email", autocomplete="email")
+        lg_pw = st.text_input("Password", type="password", key="lg_pw", autocomplete="current-password")
+        if st.button("Login", type="primary"):
+            if not _is_valid_email(lg_email):
+                st.error("Please enter a valid email address.")
+            else:
+                email_norm = lg_email.strip().lower()
+
+                legacy_ok = False
+                if env_bootstrap_exists():
+                    exp = _get_env("IDS_USER", "").strip().lower()
+                    if email_norm == exp and lg_pw == _get_env("IDS_PASS", ""):
+                        legacy_ok = True
+
+                ok, msg = verify_user(PROJECT_ROOT, lg_email, lg_pw)
+                if legacy_ok or ok:
+                    st.session_state.authed = True
+                    st.session_state.user_email = lg_email.strip()
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.caption(
+        "Accounts are stored locally in `data/app_users.json` (hashed passwords). "
+        "On Streamlit Community Cloud, this file may reset when the app rebuilds—"
+        "use Sign up again, or rely on optional `IDS_USER`/`IDS_PASS` secrets for a fixed login."
+    )
     return False
 
 
@@ -360,6 +391,14 @@ def main() -> None:
 
     if not check_login():
         return
+
+    if st.sidebar.button("Logout"):
+        st.session_state.authed = False
+        st.session_state.user_email = ""
+        for k in ("last_report_pdf", "last_scan_summary"):
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
     model_path = sidebar_model_picker()
     st.sidebar.header("Navigation")
