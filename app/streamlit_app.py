@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -75,14 +76,25 @@ def _get_env(key: str, default: str) -> str:
     return v if v is not None and v != "" else default
 
 
+# Practical pattern for campus emails (e.g. user@dept.skit.ac.in); avoids ghost "invalid" on Cloud
+_EMAIL_RE = re.compile(r"^[\w.!#$%&'*+/=?^`{|}~-]+@(?:[\w-]+\.)+[\w-]{2,}$")
+
+
+def _normalize_email(s: str) -> str:
+    t = (s or "").strip()
+    t = t.replace("\u200b", "").replace("\u200c", "").replace("\ufeff", "")
+    t = t.replace("＠", "@")
+    t = t.replace("﹫", "@")
+    if "\r" in t or "\n" in t:
+        t = t.splitlines()[0].strip()
+    return t
+
+
 def _is_valid_email(s: str) -> bool:
-    s = s.strip()
-    if "@" not in s or s.count("@") != 1:
+    t = _normalize_email(s)
+    if not t or t.count("@") != 1:
         return False
-    local, domain = s.split("@", 1)
-    if not local or not domain or "." not in domain:
-        return False
-    return True
+    return bool(_EMAIL_RE.fullmatch(t))
 
 
 def check_login() -> bool:
@@ -100,45 +112,49 @@ def check_login() -> bool:
     tab_signup, tab_login = st.tabs(["Sign up", "Login"])
 
     with tab_signup:
-        su_email = st.text_input("Email", key="su_email", autocomplete="email")
-        su_pw = st.text_input("Password", type="password", key="su_pw", autocomplete="new-password")
-        su_pw2 = st.text_input(
-            "Confirm password", type="password", key="su_pw2", autocomplete="new-password"
-        )
-        if st.button("Create account", type="primary"):
-            if not _is_valid_email(su_email):
-                st.error("Please enter a valid email address.")
-            elif su_pw != su_pw2:
-                st.error("Passwords do not match.")
-            else:
-                ok, msg = sign_up(PROJECT_ROOT, su_email, su_pw)
-                if ok:
-                    st.success(msg)
+        with st.form("signup_form", clear_on_submit=False):
+            su_email = st.text_input("Email", key="su_email", autocomplete="email", placeholder="you@university.edu")
+            su_pw = st.text_input("Password", type="password", key="su_pw", autocomplete="new-password")
+            su_pw2 = st.text_input(
+                "Confirm password", type="password", key="su_pw2", autocomplete="new-password"
+            )
+            if st.form_submit_button("Create account", type="primary"):
+                su_email = _normalize_email(su_email)
+                if not _is_valid_email(su_email):
+                    st.error("Please enter a valid email address (check for extra spaces or special @ character).")
+                elif su_pw != su_pw2:
+                    st.error("Passwords do not match.")
                 else:
-                    st.error(msg)
+                    ok, msg = sign_up(PROJECT_ROOT, su_email, su_pw)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
     with tab_login:
-        lg_email = st.text_input("Email", key="lg_email", autocomplete="email")
-        lg_pw = st.text_input("Password", type="password", key="lg_pw", autocomplete="current-password")
-        if st.button("Login", type="primary"):
-            if not _is_valid_email(lg_email):
-                st.error("Please enter a valid email address.")
-            else:
-                email_norm = lg_email.strip().lower()
-
-                legacy_ok = False
-                if env_bootstrap_exists():
-                    exp = _get_env("IDS_USER", "").strip().lower()
-                    if email_norm == exp and lg_pw == _get_env("IDS_PASS", ""):
-                        legacy_ok = True
-
-                ok, msg = verify_user(PROJECT_ROOT, lg_email, lg_pw)
-                if legacy_ok or ok:
-                    st.session_state.authed = True
-                    st.session_state.user_email = lg_email.strip()
-                    st.rerun()
+        with st.form("login_form", clear_on_submit=False):
+            lg_email = st.text_input("Email", key="lg_email", autocomplete="email", placeholder="you@university.edu")
+            lg_pw = st.text_input("Password", type="password", key="lg_pw", autocomplete="current-password")
+            if st.form_submit_button("Login", type="primary"):
+                lg_email = _normalize_email(lg_email)
+                if not _is_valid_email(lg_email):
+                    st.error("Please enter a valid email address (check for extra spaces or special @ character).")
                 else:
-                    st.error(msg)
+                    email_norm = lg_email.lower()
+
+                    legacy_ok = False
+                    if env_bootstrap_exists():
+                        exp = _get_env("IDS_USER", "").strip().lower()
+                        if email_norm == exp and lg_pw == _get_env("IDS_PASS", ""):
+                            legacy_ok = True
+
+                    ok, msg = verify_user(PROJECT_ROOT, lg_email, lg_pw)
+                    if legacy_ok or ok:
+                        st.session_state.authed = True
+                        st.session_state.user_email = lg_email
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
     st.caption(
         "Accounts are stored locally in `data/app_users.json` (hashed passwords). "
