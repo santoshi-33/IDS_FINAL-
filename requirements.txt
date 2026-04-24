@@ -5,7 +5,7 @@ pandas
 numpy
 matplotlib
 seaborn
-streamlit
+streamlit>=1.38.0
 joblib
 plotly
 imbalanced-learn

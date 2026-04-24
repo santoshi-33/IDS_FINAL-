@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as st_components
 from sklearn.metrics import confusion_matrix
 import subprocess
 
@@ -30,6 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from ids.live import scapy_sniff_available, simulate_stream
 from ids.pipeline import predict_df, predict_from_path_csv_in_chunks, predict_from_uploaded_csv_in_chunks
 from ids.synthetic_bench import dataframe_nsl_synthetic, write_until_size
+from ids.auth_session import COOKIE_NAME, make_session_token, parse_session_token
 from ids.reporting import build_ids_report_pdf, load_metrics_json
 from ids.user_store import env_bootstrap_exists, sign_up, verify_user
 
@@ -116,6 +118,87 @@ def _is_valid_email(s: str) -> bool:
     return bool(_EMAIL_RE.fullmatch(t))
 
 
+def _read_ids_session_cookie() -> Optional[str]:
+    """Read signed session cookie (Streamlit 1.38+ exposes ``st.context.cookies``)."""
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx is None:
+            return None
+        raw = getattr(ctx, "cookies", None)
+        if not raw:
+            return None
+        v = raw.get(COOKIE_NAME) if isinstance(raw, dict) else None
+        if v is None and not isinstance(raw, dict):
+            try:
+                v = raw[COOKIE_NAME]  # type: ignore[index]
+            except Exception:
+                v = None
+        if v is None or not str(v).strip():
+            return None
+        return str(v).strip()
+    except Exception:
+        return None
+
+
+def _emit_session_cookie_javascript(token: str) -> None:
+    """Set browser cookie via hidden iframe; survives refresh. Server reads with ``st.context.cookies`` (Streamlit 1.38+)."""
+    t_json = json.dumps(token)
+    st_components.html(
+        f"""<script>
+(function(){{
+  const t = {t_json};
+  const name = {json.dumps(COOKIE_NAME)};
+  const maxAge = 60 * 60 * 24 * 30;
+  let c = name + '=' + encodeURIComponent(t) + '; max-age=' + maxAge + '; path=/; SameSite=Lax';
+  if (window.location && window.location.protocol === 'https:') {{ c += '; Secure'; }}
+  document.cookie = c;
+}})();
+</script>""",
+        height=0,
+        width=0,
+    )
+
+
+def _emit_clear_session_cookie_javascript() -> None:
+    st_components.html(
+        f"""<script>
+(function(){{
+  const name = {json.dumps(COOKIE_NAME)};
+  let c = name + '=; max-age=0; path=/; SameSite=Lax';
+  if (window.location && window.location.protocol === 'https:') {{ c += '; Secure'; }}
+  document.cookie = c;
+}})();
+</script>""",
+        height=0,
+        width=0,
+    )
+
+
+def _try_restore_auth_from_cookie() -> bool:
+    """If server sees a valid cookie, restore authed + email. Returns True if state changed."""
+    if st.session_state.get("authed"):
+        return False
+    if st.session_state.get("ids_logout_clears_cookie"):
+        return False
+    cval = _read_ids_session_cookie()
+    if not cval:
+        return False
+    email = parse_session_token(cval)
+    if not email:
+        return False
+    st.session_state.authed = True
+    st.session_state.user_email = email
+    return True
+
+
+def _persist_new_login_email(email: str) -> None:
+    """Write cookie + mark session as logged in (call before ``st.rerun``)."""
+    st.session_state.pop("ids_logout_clears_cookie", None)
+    st.session_state.authed = True
+    st.session_state.user_email = _normalize_email(email)
+    _emit_session_cookie_javascript(make_session_token(st.session_state.user_email))
+
+
 def check_login() -> bool:
     if "authed" not in st.session_state:
         st.session_state.authed = False
@@ -123,6 +206,9 @@ def check_login() -> bool:
         st.session_state.user_email = ""
 
     if st.session_state.authed:
+        return True
+
+    if _try_restore_auth_from_cookie():
         return True
 
     st.title(APP_TITLE)
@@ -147,6 +233,8 @@ def check_login() -> bool:
                     ok, msg = sign_up(PROJECT_ROOT, su_email, su_pw)
                     if ok:
                         st.success(msg)
+                        _persist_new_login_email(su_email)
+                        st.rerun()
                     else:
                         st.error(msg)
 
@@ -169,16 +257,15 @@ def check_login() -> bool:
 
                     ok, msg = verify_user(PROJECT_ROOT, lg_email, lg_pw)
                     if legacy_ok or ok:
-                        st.session_state.authed = True
-                        st.session_state.user_email = lg_email
+                        _persist_new_login_email(lg_email)
                         st.rerun()
                     else:
                         st.error(msg)
 
     st.caption(
-        "Accounts are stored locally in `data/app_users.json` (hashed passwords). "
-        "On Streamlit Community Cloud, this file may reset when the app rebuilds—"
-        "use Sign up again, or rely on optional `IDS_USER`/`IDS_PASS` secrets for a fixed login."
+        "Passwords: `data/app_users.json` (hashed). **Stay signed in** uses a signed cookie (30 days); "
+        "set **`IDS_SESSION_SECRET`** in [Streamlit secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/get-started#secrets) for production. "
+        "On Community Cloud, `app_users.json` can reset on redeploy—sign up again or use `IDS_USER` / `IDS_PASS`."
     )
     return False
 
@@ -1015,12 +1102,18 @@ def main() -> None:
         return
 
     if st.sidebar.button("Logout"):
+        st.session_state.ids_logout_clears_cookie = True
         st.session_state.authed = False
         st.session_state.user_email = ""
+        _emit_clear_session_cookie_javascript()
         for k in ("last_report_pdf", "last_scan_summary"):
             if k in st.session_state:
                 del st.session_state[k]
         st.rerun()
+
+    em = str(st.session_state.get("user_email", "") or "").strip()
+    if em:
+        st.sidebar.caption(f"Signed in as **{em}**")
 
     model_path = sidebar_model_picker()
     st.sidebar.header("Navigation")
