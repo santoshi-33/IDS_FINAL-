@@ -292,3 +292,78 @@ def predict_from_uploaded_csv_in_chunks(
     }
     return summary, out_path, prev, err
 
+
+def predict_from_path_csv_in_chunks(
+    pipeline: Any,
+    path: str,
+    *,
+    label_col: Optional[str] = None,
+    chunksize: int = LARGE_CSV_DEFAULT_CHUNK,
+) -> tuple[dict, str, pd.DataFrame, Optional[str]]:
+    """
+    Same as ``predict_from_uploaded_csv_in_chunks`` but for a file path on disk (e.g. server `data/test_cases/`
+    or a temp file from URL download) — no browser upload step.
+    """
+    import os
+    import tempfile
+
+    path = str(path)
+    if not path or not os.path.isfile(path):
+        return ({"rows": 0, "attack": 0, "normal": 0, "result_path": ""}, "", pd.DataFrame(), "File not found.")
+
+    name = os.path.basename(path)
+
+    tfp = tempfile.NamedTemporaryFile(
+        delete=False, prefix="ids_pred_", suffix=".csv", mode="w", encoding="utf-8", newline=""
+    )
+    out_path = tfp.name
+    tfp.close()
+
+    kwargs = {"chunksize": int(chunksize), "low_memory": False, **_read_csv_kwargs_for_name(name)}
+
+    total = 0
+    attack = 0
+    preview_rows: list[pd.DataFrame] = []
+    max_preview = 1_200
+    n_preview = 0
+    first_chunk = True
+
+    reader = pd.read_csv(path, **kwargs)
+    for chunk in reader:
+        if not isinstance(chunk, pd.DataFrame) or len(chunk) == 0:
+            break
+        out = predict_df(pipeline, chunk, label_col=label_col)
+        t = len(out)
+        total += t
+        attack += int((out["prediction"] == "attack").sum())
+        if first_chunk:
+            out.to_csv(out_path, index=False, mode="w", header=True)
+            first_chunk = False
+        else:
+            out.to_csv(out_path, index=False, mode="a", header=False)
+        if n_preview < max_preview:
+            take = min(len(out), max_preview - n_preview)
+            if take:
+                preview_rows.append(out.head(take))
+                n_preview += take
+    normal = int(total) - int(attack)
+    if preview_rows:
+        prev = pd.concat(preview_rows, ignore_index=True)
+    else:
+        prev = pd.DataFrame()
+    err = None
+    if first_chunk:
+        err = "No rows read from the file."
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        return ({"rows": 0, "attack": 0, "normal": 0, "result_path": ""}, "", prev, err)
+    summary = {
+        "rows": int(total),
+        "attack": int(attack),
+        "normal": int(normal),
+        "result_path": out_path,
+    }
+    return summary, out_path, prev, err
+

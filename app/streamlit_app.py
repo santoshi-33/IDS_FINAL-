@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import gzip
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import sys
+import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from typing import Any, Dict, Optional
 
 import joblib
@@ -22,7 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ids.live import scapy_sniff_available, simulate_stream
-from ids.pipeline import predict_df, predict_from_uploaded_csv_in_chunks
+from ids.pipeline import predict_df, predict_from_path_csv_in_chunks, predict_from_uploaded_csv_in_chunks
 from ids.reporting import build_ids_report_pdf, load_metrics_json
 from ids.user_store import env_bootstrap_exists, sign_up, verify_user
 
@@ -319,6 +324,100 @@ def _preview_upload_nrows(up: Any, n: int = 100) -> pd.DataFrame:
     return pd.read_csv(up, nrows=n, low_memory=False)
 
 
+def _list_test_case_csvs() -> list[Path]:
+    if not TEST_CASES_DIR.is_dir():
+        return []
+    out: list[Path] = []
+    for p in sorted(TEST_CASES_DIR.iterdir(), key=lambda x: x.name.lower()):
+        if not p.is_file():
+            continue
+        n = p.name.lower()
+        if n.endswith(".csv") or n.endswith(".gz"):
+            out.append(p)
+    return out
+
+
+def _read_path_csv(path: Path, *, nrows: Optional[int] = None) -> pd.DataFrame:
+    name = path.name.lower()
+    kw: dict = {"low_memory": False}
+    if name.endswith(".gz"):
+        kw["compression"] = "gzip"
+    if nrows is not None:
+        kw["nrows"] = nrows
+    return pd.read_csv(path, **kw)
+
+
+def _clear_url_temp_in_session() -> None:
+    p = st.session_state.pop("ids_url_temp_path", None)
+    if isinstance(p, str) and os.path.isfile(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _url_host_is_public(url: str) -> tuple[bool, str]:
+    """Block obvious SSRF targets (localhost / private IPs)."""
+    p = urlparse(url.strip())
+    host = p.hostname
+    if not host:
+        return False, "Invalid URL (no host)."
+    try:
+        for res in socket.getaddrinfo(host, None):
+            ipstr = res[4][0]
+            ip = ipaddress.ip_address(ipstr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False, "That host resolves to a private or local address (blocked)."
+    except OSError as e:
+        return False, f"Could not resolve host: {e}"
+    return True, ""
+
+
+def _download_url_to_tempfile(url: str) -> tuple[Optional[str], Optional[str]]:
+    p = urlparse(url.strip())
+    if p.scheme not in ("http", "https"):
+        return None, "Only http:// and https:// URLs are allowed."
+    ok, msg = _url_host_is_public(url)
+    if not ok:
+        return None, msg
+    path_part = (p.path or "").lower()
+    ext = ".gz" if path_part.endswith((".gz", ".gzip")) else ".csv"
+    max_b = MAX_UPLOAD_MB * 1024 * 1024
+    fd, path = tempfile.mkstemp(prefix="ids_url_", suffix=ext)
+    try:
+        with os.fdopen(fd, "wb") as outf:
+            req = Request(url.strip(), headers={"User-Agent": "IDS-Streamlit/1.0", "Accept": "*/*"}, method="GET")
+            with urlopen(req, timeout=300) as resp:
+                total = 0
+                while True:
+                    chunk = resp.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_b:
+                        return None, f"Download exceeds {MAX_UPLOAD_MB} MB (app limit)."
+                    outf.write(chunk)
+    except Exception as e:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+        return None, str(e)
+    return path, None
+
+
+def _cleanup_pred_temp_keys() -> None:
+    for _k in ("ids_pred_temp_csv", "ids_pred_gz_path"):
+        _p = st.session_state.get(_k)
+        if _p and isinstance(_p, str) and os.path.isfile(_p):
+            try:
+                os.remove(_p)
+            except OSError:
+                pass
+        st.session_state.pop(_k, None)
+
+
 def _write_scan_result_ui(out: pd.DataFrame, *, use_chunked: bool) -> None:
     _ = use_chunked
     st.subheader("Results (first rows)")
@@ -486,11 +585,12 @@ def _write_scan_result_chunked_ui(
 def render_upload_and_scan(pipe: Any) -> None:
     st.header("Upload Dataset to Scan Attacks")
     st.info(
-        "**~1 GB uploads are supported** after the file is fully uploaded. "
-        "The app will **stream the CSV in chunks** (no need to load 1 GB into RAM at once). "
-        "Upload time still depends on your **internet upload speed** (often 20–60+ min for 1 GB). "
-        "Use **`.csv.gz`** for a smaller upload, or set **max rows** for a quick test. "
-        "Charts for huge runs use a **preview sample**; metrics use **all rows**."
+        "**Large files:** The app can **scan in chunks** (no 1 GB RAM spike). "
+        "**Slow “buffering” in the uploader** = your **browser is still uploading** to Streamlit — that part cannot be sped up in code. "
+        "**Tip (Cloud):** use **Server file** after **Test case files → Generate** so **no 200 MB upload from your PC**. "
+        "Or use **URL** so the **server downloads** the file. "
+        "If you must upload from PC, **`.csv.gz`** is smaller. **Max rows** = faster tests. "
+        "Charts on huge runs use a **preview sample**; metrics use **all rows**."
     )
     demo_df = _load_default_demo_df()
     if demo_df is not None:
@@ -498,6 +598,10 @@ def render_upload_and_scan(pipe: Any) -> None:
         use_demo = st.toggle("Use demo dataset (`data/test.csv`)", value=True)
     else:
         use_demo = False
+
+    data_source = "upload"
+    up: Any = None
+    work_path: Optional[Path] = None
 
     max_rows = 0
     if not use_demo:
@@ -507,43 +611,123 @@ def render_upload_and_scan(pipe: Any) -> None:
                 min_value=0,
                 value=0,
                 step=10_000,
-                help="Use 0 to scan 100% of the uploaded data. Set e.g. 100000 to test faster.",
+                help="Use 0 to scan 100% of the data. Set e.g. 100000 to test faster.",
             )
         )
     nrows: Optional[int] = None if max_rows <= 0 else max_rows
 
-    up = (
-        None
-        if use_demo
-        else st.file_uploader(
-            "Upload CSV or GZIP (.csv / .csv.gz) — up to 2 GB in this app config",
-            type=["csv", "gz"],
-            help="Gzip on your PC first to upload faster. Max size: see maxUploadSize in .streamlit/config.toml.",
+    if not use_demo:
+        data_source = st.radio(
+            "Where is the CSV?",
+            options=["server", "upload", "url"],
+            format_func=lambda x: {
+                "server": "Server file (fast on Cloud — no big PC upload)",
+                "upload": "Upload from my PC (spinner = file still uploading)",
+                "url": "From HTTPS URL (server downloads — no PC upload)",
+            }[x],
+            horizontal=True,
+            key="ids_data_source",
         )
-    )
+        if data_source != "url" and st.session_state.get("ids_url_temp_path"):
+            _clear_url_temp_in_session()
+
+        if data_source == "server":
+            choices = _list_test_case_csvs()
+            if choices:
+                pick = st.selectbox(
+                    "Pick a file already on the app server (`data/test_cases/`)",
+                    options=[c.name for c in choices],
+                    key="ids_server_pick",
+                )
+                work_path = TEST_CASES_DIR / pick
+            else:
+                st.warning(
+                    "No CSV/GZ in `data/test_cases/` yet. Open **Test case files** → **Generate** "
+                    "(e.g. 200 MB), then return here and choose **Server file** — **no long upload from your PC**."
+                )
+        elif data_source == "upload":
+            st.warning(
+                "The ⏳ next to the file name means **upload to Streamlit is still in progress** — this is **not** "
+                "the ML scan yet. **200 MB** often takes **many minutes** on typical home upload speeds. "
+                "To skip this: use **Server file** (generate on **Test case files**) or **URL**."
+            )
+            up = st.file_uploader(
+                "Upload CSV or GZIP (.csv / .csv.gz) — up to 2 GB in this app config",
+                type=["csv", "gz"],
+                help="Gzip on your PC first for a smaller upload.",
+            )
+        else:
+            st.caption(
+                "The app downloads the file **on the server** (good for public links). "
+                "Private networks / localhost URLs are blocked."
+            )
+            url_in = st.text_input("HTTPS URL to `.csv` or `.gz`", placeholder="https://…", key="ids_url_input")
+            c_fetch, c_clear = st.columns(2)
+            with c_fetch:
+                if st.button("Fetch to server", type="primary", key="ids_url_fetch"):
+                    if not (url_in or "").strip():
+                        st.error("Paste a URL first.")
+                    else:
+                        ok, _m = _url_host_is_public(url_in)
+                        if not ok:
+                            st.error(_m)
+                        else:
+                            with st.status("Downloading…", expanded=True) as dl_st:
+                                pth, err = _download_url_to_tempfile(url_in)
+                                if err:
+                                    dl_st.update(label="Download failed", state="error")
+                                    st.error(err)
+                                else:
+                                    st.session_state["ids_url_temp_path"] = pth
+                                    dl_st.update(label="Download complete", state="complete")
+                                    st.rerun()
+            with c_clear:
+                if st.button("Clear fetched file", key="ids_url_clear"):
+                    _clear_url_temp_in_session()
+                    st.rerun()
+            _ut = st.session_state.get("ids_url_temp_path")
+            if isinstance(_ut, str) and os.path.isfile(_ut):
+                work_path = Path(_ut)
+
     label_col = st.text_input("Label column (optional, will be ignored)", value="")
     lcol: Optional[str] = label_col.strip() or None
 
-    if not use_demo and up is None:
-        st.caption("Upload a CSV similar to NSL-KDD / CICIDS2017 feature tables.")
-        return
+    if use_demo:
+        run_ok = demo_df is not None
+    elif data_source == "server":
+        run_ok = work_path is not None and work_path.is_file()
+    elif data_source == "url":
+        run_ok = work_path is not None and work_path.is_file()
+    else:
+        run_ok = up is not None
 
     st.subheader("Preview (first 100 rows)")
     if use_demo and demo_df is not None:
         st.dataframe(demo_df.head(100), use_container_width=True)
         st.caption("Demo set — first 100 rows.")
+    elif not use_demo and not run_ok:
+        st.caption("Select a **server file**, finish **URL fetch**, or finish **PC upload** to see a preview.")
+    elif work_path is not None and work_path.is_file():
+        try:
+            prev = _read_path_csv(work_path, nrows=100)
+            st.dataframe(prev, use_container_width=True)
+            st.caption(
+                f"On-server file ≈ **{_fmt_file_size(work_path.stat().st_size)}** — **not** uploading from your browser."
+            )
+        except Exception as e:
+            st.error(f"Preview failed: {e}")
     elif up is not None:
         prev = _preview_upload_nrows(up, 100)
         sz = _uploaded_file_size_bytes(up)
         st.dataframe(prev, use_container_width=True)
         st.caption(
-            f"Uploaded size ≈ **{_fmt_file_size(sz)}**. Showing first 100 rows only. "
-            "If your upload is 1 GB, wait until the browser upload finishes, then run detection."
+            f"Uploaded size ≈ **{_fmt_file_size(sz)}**. First 100 rows. "
+            "Wait until the uploader spinner finishes, then click **Run Detection**."
         )
     else:
-        st.warning("Turn off **Use demo** and upload a CSV, or add `data/test.csv` for demo mode.")
+        st.warning("Turn on **demo**, or choose a data source above.")
 
-    if not st.button("Run Detection", type="primary"):
+    if not st.button("Run Detection", type="primary", disabled=not run_ok):
         return
 
     if use_demo and demo_df is None:
@@ -554,34 +738,26 @@ def render_upload_and_scan(pipe: Any) -> None:
         with st.spinner("Running detection on full demo data…"):
             out = predict_df(pipe, demo_df, label_col=lcol)
         _write_scan_result_ui(out, use_chunked=False)
+        return
 
-    elif up is not None and nrows is not None and nrows > 0:
-        up.seek(0)
-        with st.spinner(f"Loading first {nrows:,} rows…"):
-            df = _read_streamlit_uploaded_csv(up, nrows=nrows)
-        out = predict_df(pipe, df, label_col=lcol)
-        _write_scan_result_ui(out, use_chunked=False)
+    if work_path is not None and work_path.is_file():
+        if nrows is not None and nrows > 0:
+            with st.spinner(f"Loading first {nrows:,} rows…"):
+                df = _read_path_csv(work_path, nrows=nrows)
+            out = predict_df(pipe, df, label_col=lcol)
+            _write_scan_result_ui(out, use_chunked=False)
+            return
 
-    elif up is not None:
-        up.seek(0)
-        sz2 = _uploaded_file_size_bytes(up)
+        sz2 = work_path.stat().st_size
         if sz2 > LARGE_UPLOAD_BYTES and (nrows is None or nrows <= 0):
-            for _k in ("ids_pred_temp_csv", "ids_pred_gz_path"):
-                _p = st.session_state.get(_k)
-                if _p and isinstance(_p, str) and os.path.isfile(_p):
-                    try:
-                        os.remove(_p)
-                    except OSError:
-                        pass
-                st.session_state.pop(_k, None)
+            _cleanup_pred_temp_keys()
             st.success(
                 f"**Large file mode** (~{_fmt_file_size(sz2)}): processing in **chunks** (safe for 1 GB+). "
                 "This can take many minutes; do not close the tab."
             )
-            up.seek(0)
             with st.status("Scanning file in chunks (full dataset)…", expanded=True) as status:
-                summary, tpath, prev, err = predict_from_uploaded_csv_in_chunks(
-                    pipe, up, label_col=lcol, chunksize=200_000
+                summary, tpath, prev, err = predict_from_path_csv_in_chunks(
+                    pipe, str(work_path), label_col=lcol, chunksize=200_000
                 )
                 if err:
                     status.update(label="Scan failed", state="error")
@@ -591,12 +767,52 @@ def render_upload_and_scan(pipe: Any) -> None:
             if tpath and os.path.isfile(tpath):
                 st.session_state["ids_pred_temp_csv"] = tpath
             _write_scan_result_chunked_ui(summary, prev, tpath, lcol)
-        else:
-            with st.spinner("Loading file…"):
-                up.seek(0)
-                df = _read_streamlit_uploaded_csv(up, nrows=None)
-            out = predict_df(pipe, df, label_col=lcol)
-            _write_scan_result_ui(out, use_chunked=False)
+            return
+
+        with st.spinner("Loading file…"):
+            df = _read_path_csv(work_path, nrows=None)
+        out = predict_df(pipe, df, label_col=lcol)
+        _write_scan_result_ui(out, use_chunked=False)
+        return
+
+    if up is None:
+        return
+
+    if nrows is not None and nrows > 0:
+        up.seek(0)
+        with st.spinner(f"Loading first {nrows:,} rows…"):
+            df = _read_streamlit_uploaded_csv(up, nrows=nrows)
+        out = predict_df(pipe, df, label_col=lcol)
+        _write_scan_result_ui(out, use_chunked=False)
+        return
+
+    up.seek(0)
+    sz2 = _uploaded_file_size_bytes(up)
+    if sz2 > LARGE_UPLOAD_BYTES and (nrows is None or nrows <= 0):
+        _cleanup_pred_temp_keys()
+        st.success(
+            f"**Large file mode** (~{_fmt_file_size(sz2)}): processing in **chunks** (safe for 1 GB+). "
+            "This can take many minutes; do not close the tab."
+        )
+        up.seek(0)
+        with st.status("Scanning file in chunks (full dataset)…", expanded=True) as status:
+            summary, tpath, prev, err = predict_from_uploaded_csv_in_chunks(
+                pipe, up, label_col=lcol, chunksize=200_000
+            )
+            if err:
+                status.update(label="Scan failed", state="error")
+                st.error(err)
+                return
+            status.update(label="Scan complete", state="complete")
+        if tpath and os.path.isfile(tpath):
+            st.session_state["ids_pred_temp_csv"] = tpath
+        _write_scan_result_chunked_ui(summary, prev, tpath, lcol)
+    else:
+        with st.spinner("Loading file…"):
+            up.seek(0)
+            df = _read_streamlit_uploaded_csv(up, nrows=None)
+        out = predict_df(pipe, df, label_col=lcol)
+        _write_scan_result_ui(out, use_chunked=False)
 
 
 def render_test_case_library() -> None:
@@ -608,7 +824,7 @@ def render_test_case_library() -> None:
         "use **Upload & Scan** to run the model on one of these files. "
         f"**Max upload in this app config:** **{MAX_UPLOAD_MB} MB** (`.streamlit/config.toml` `maxUploadSize`). "
         "Uploading 200 MB–1 GB is **slow** (depends on your internet **upload** speed, not download). "
-        "On Cloud, prefer **Generate** here so no big upload. "
+        "On Cloud, prefer **Generate** here, then in **Upload & Scan** pick **Server file** so no big upload. "
         "You can also gzip the CSV on your PC and upload `.gz` in **Upload & Scan** to save time."
     )
     TEST_CASES_DIR.mkdir(parents=True, exist_ok=True)
