@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from typing import Any, Dict, Optional
 
 import joblib
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -28,6 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from ids.live import scapy_sniff_available, simulate_stream
 from ids.pipeline import predict_df, predict_from_path_csv_in_chunks, predict_from_uploaded_csv_in_chunks
+from ids.synthetic_bench import dataframe_nsl_synthetic, write_until_size
 from ids.reporting import build_ids_report_pdf, load_metrics_json
 from ids.user_store import env_bootstrap_exists, sign_up, verify_user
 
@@ -78,10 +80,14 @@ def _save_upload_to_test_cases(uploaded, safe_name: str) -> None:
     dest.write_bytes(uploaded.getvalue())
 
 
-def _run_generate_subprocess(extra: list[str]) -> subprocess.CompletedProcess[str]:
-    script = PROJECT_ROOT / "scripts" / "generate_test_datasets.py"
-    cmd = [sys.executable, str(script), "--out-dir", "data/test_cases", "--no-legacy-synth-names", *extra]
-    return subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True, check=False)
+def _generate_test_case_file_inprocess(dest: Path, target_bytes: int) -> tuple[bool, str]:
+    """Write a benchmark-size CSV in the Streamlit process (avoids failing subprocess/CLI on Cloud)."""
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        write_until_size(dest, int(target_bytes), np.random.default_rng(42))
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def _get_env(key: str, default: str) -> str:
@@ -594,6 +600,26 @@ def render_upload_and_scan(pipe: Any) -> None:
         "If you must upload from PC, **`.csv.gz`** is smaller. **Max rows** = faster tests. "
         "Charts on huge runs use a **preview sample**; metrics use **all rows**."
     )
+    with st.expander("Juggad — instant scan (no upload, no file on disk)", expanded=True):
+        st.caption(
+            "Cloud pe **upload/Generate** fail ho to **yahi** use karo: benchmark jaisa synthetic data **RAM** mein banta hai, phir model chalta hai. "
+            "Column `label` prediction se hata diya gaya."
+        )
+        jrows = st.selectbox(
+            "Rows (keep ≤100k for free tier stability)",
+            [2000, 5000, 10_000, 25_000, 50_000, 100_000],
+            index=2,
+            key="ids_juggad_rows",
+        )
+        if st.button("Run instant synthetic scan", type="primary", key="ids_juggad_run"):
+            with st.status("Synthesizing + model…", expanded=True) as juggad_status:
+                jdf = dataframe_nsl_synthetic(int(jrows), seed=42)
+                juggad_status.write(f"Rows: {len(jdf):,} — running inference…")
+                jout = predict_df(pipe, jdf, label_col="label")
+                juggad_status.update(label="Done", state="complete")
+            _write_scan_result_ui(jout, use_chunked=False)
+            st.stop()
+
     demo_df = _load_default_demo_df()
     if demo_df is not None:
         st.success("Demo dataset found at `data/test.csv`. You can use it without uploading.")
@@ -824,6 +850,7 @@ def render_test_case_library() -> None:
     st.caption(
         f"Folder `{rel}/` — **9 preset sizes** (10 KB → 1 GB). NSL-KDD–shaped synthetic CSV; "
         "use **Upload & Scan** to run the model on one of these files. "
+        "**Generate** runs **in-process** (no extra Python subprocess) so it works more reliably on Streamlit Cloud. "
         f"**On this page, browser upload is only for tiers ≤ ~{_fmt_file_size(TEST_CASE_IN_PAGE_UPLOAD_MAX)}.** "
         "For **100 MB+** tiers we **turn off upload** (it only caused endless buffering) — use **Generate this file only** instead. "
         f"**Max file size in app config:** **{MAX_UPLOAD_MB} MB** (`.streamlit/config.toml` `maxUploadSize`). "
@@ -834,35 +861,38 @@ def render_test_case_library() -> None:
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Generate all 8 (10 KB → 200 MB)", type="primary", key="tc_bench8"):
-            with st.status("Generating 8 benchmark CSVs (may take several minutes)…", expanded=True) as status:
-                proc = _run_generate_subprocess(["--benchmark-tiers"])
-                out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-                st.code(out or "(no output)")
-                if proc.returncode == 0:
+            with st.status("Writing 8 benchmark CSVs in-process (may take a few minutes)…", expanded=True) as status:
+                failed: list[str] = []
+                for _label, fname, tbytes in BENCHMARK_FILES[:8]:
+                    st.write(f"… `{fname}`")
+                    dest = TEST_CASES_DIR / fname
+                    ok, err = _generate_test_case_file_inprocess(dest, tbytes)
+                    if not ok:
+                        failed.append(f"{fname}: {err}")
+                if failed:
+                    status.update(label="Some writes failed", state="error")
+                    st.error("\n".join(failed))
+                else:
                     status.update(label="Done.", state="complete")
                     st.rerun()
-                else:
-                    status.update(label="Failed.", state="error")
-                    st.error("Generator failed.")
     with c2:
         if st.button("Generate + ~1 GB file (very slow)", key="tc_bench1g"):
-            with st.status("Generating 8 tiers + ~1 GB (long)…", expanded=True) as status:
-                proc = _run_generate_subprocess(["--benchmark-tiers", "--include-1gb"])
-                st.code((proc.stdout or "") + "\n" + (proc.stderr or "") or "(no output)")
-                if proc.returncode == 0:
+            with st.status("Writing 9 files including ~1 GB (long, may time out on free Cloud)…", expanded=True) as status:
+                failed = []
+                for _label, fname, tbytes in BENCHMARK_FILES:
+                    st.write(f"… `{fname}`")
+                    dest = TEST_CASES_DIR / fname
+                    ok, err = _generate_test_case_file_inprocess(dest, tbytes)
+                    if not ok:
+                        failed.append(f"{fname}: {err}")
+                if failed:
+                    status.update(label="Some writes failed", state="error")
+                    st.error("\n".join(failed))
+                else:
                     status.update(label="Done.", state="complete")
                     st.rerun()
-                else:
-                    status.update(label="Failed.", state="error")
-                    st.error("Generator failed.")
 
     for label, fname, tbytes in BENCHMARK_FILES:
-        gen_args: list[str] = [
-            "--out-file",
-            fname,
-            "--target-bytes",
-            str(tbytes),
-        ]
         path = TEST_CASES_DIR / fname
         exists = path.is_file()
         upload_ok = tbytes <= MAX_UPLOAD_MB * 1024 * 1024
@@ -904,15 +934,14 @@ def render_test_case_library() -> None:
                 except Exception as e:
                     st.error(str(e))
             if st.button("Generate this file only", key=f"tc_gen_{fname}"):
-                with st.status(f"Writing `{fname}`…", expanded=True) as status:
-                    proc = _run_generate_subprocess(gen_args)
-                    st.code((proc.stdout or "") + "\n" + (proc.stderr or "") or "(no output)")
-                    if proc.returncode == 0:
+                with st.status(f"Writing `{fname}` (in-process)…", expanded=True) as status:
+                    ok, err = _generate_test_case_file_inprocess(path, tbytes)
+                    if not ok:
+                        status.update(label="Failed.", state="error")
+                        st.error(err or "Write failed.")
+                    else:
                         status.update(label="Done.", state="complete")
                         st.rerun()
-                    else:
-                        status.update(label="Failed.", state="error")
-                        st.error("Generator failed.")
 
     st.divider()
     st.subheader("All CSVs in this folder")
