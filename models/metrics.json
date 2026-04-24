@@ -1,0 +1,24 @@
+{
+  "accuracy": 0.999285572534233,
+  "precision": 0.999232474842231,
+  "recall": 0.999232474842231,
+  "f1": 0.999232474842231,
+  "roc_auc": 0.9999928199443255,
+  "confusion_matrix": [
+    [
+      13460,
+      9
+    ],
+    [
+      9,
+      11717
+    ]
+  ],
+  "classification_report": "              precision    recall  f1-score   support\n\n           0       1.00      1.00      1.00     13469\n           1       1.00      1.00      1.00     11726\n\n    accuracy                           1.00     25195\n   macro avg       1.00      1.00      1.00     25195\nweighted avg       1.00      1.00      1.00     25195\n",
+  "n_train": 100778,
+  "n_test": 25195,
+  "label_col": "label",
+  "use_smote": true,
+  "use_pca": false,
+  "pca_components": 20
+}

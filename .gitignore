@@ -7,8 +7,12 @@ __pycache__/
 .DS_Store
 
 data/
-models/
+# Keep built artifacts ignored, but ship a small pre-trained model for Streamlit Cloud (no on-cloud training)
+models/*
+!models/ids_model.joblib
+!models/metrics.json
 *.joblib
+!models/ids_model.joblib
 *.pkl
 
 *.csv
