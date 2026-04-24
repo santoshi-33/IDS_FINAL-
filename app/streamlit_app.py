@@ -284,8 +284,23 @@ def _load_default_demo_df() -> Optional[pd.DataFrame]:
     return None
 
 
+def _read_streamlit_uploaded_csv(up: Any, *, nrows: Optional[int] = None) -> pd.DataFrame:
+    """CSV or gzip-compressed CSV (`.csv.gz` / `.gz`) — smaller uploads for the same data."""
+    name = (getattr(up, "name", "") or "").lower()
+    if name.endswith(".gz"):
+        return pd.read_csv(up, compression="gzip", nrows=nrows, low_memory=False)
+    return pd.read_csv(up, nrows=nrows, low_memory=False)
+
+
 def render_upload_and_scan(pipe: Any) -> None:
     st.header("Upload Dataset to Scan Attacks")
+    st.info(
+        "**Why 200 MB / 1 GB uploads feel slow:** your **upload speed** (Wi‑Fi / ISP) sends every byte to the server — "
+        "often **10–40+ minutes** for hundreds of MB. This is normal. "
+        "**Faster options:** (1) export as **`.csv.gz`** and upload that (often **5–10× smaller**); "
+        "(2) set **max rows** below to test on a subset; "
+        "(3) on **Test case files**, use **Generate** on the server instead of uploading."
+    )
     demo_df = _load_default_demo_df()
     if demo_df is not None:
         st.success("Demo dataset found at `data/test.csv`. You can use it without uploading.")
@@ -293,14 +308,35 @@ def render_upload_and_scan(pipe: Any) -> None:
     else:
         use_demo = False
 
-    up = None if use_demo else st.file_uploader("Upload CSV", type=["csv"])
+    max_rows = 0
+    if not use_demo:
+        max_rows = int(
+            st.number_input(
+                "Max rows to load (0 = whole file — large files use lots of RAM/time)",
+                min_value=0,
+                value=0,
+                step=10_000,
+                help="Non-zero = only first N rows (good for quick tests on huge CSVs).",
+            )
+        )
+    nrows: Optional[int] = None if max_rows <= 0 else max_rows
+
+    up = (
+        None
+        if use_demo
+        else st.file_uploader(
+            "Upload CSV or GZIP (.csv / .csv.gz)",
+            type=["csv", "gz"],
+            help="Gzip compress on your PC first if the upload is too slow.",
+        )
+    )
     label_col = st.text_input("Label column (optional, will be ignored)", value="")
 
     if not use_demo and up is None:
         st.caption("Upload a CSV similar to NSL-KDD / CICIDS2017 feature tables.")
         return
 
-    df = demo_df if use_demo else pd.read_csv(up)  # type: ignore[arg-type]
+    df = demo_df if use_demo else _read_streamlit_uploaded_csv(up, nrows=nrows)  # type: ignore[arg-type]
     st.subheader("Preview")
     st.dataframe(df.head(50), use_container_width=True)
 
@@ -376,7 +412,9 @@ def render_test_case_library() -> None:
         f"Folder `{rel}/` — **9 preset sizes** (10 KB → 1 GB). NSL-KDD–shaped synthetic CSV; "
         "use **Upload & Scan** to run the model on one of these files. "
         f"**Max upload in this app config:** **{MAX_UPLOAD_MB} MB** (`.streamlit/config.toml` `maxUploadSize`). "
-        "On Streamlit Cloud the host may cap lower — for big files, use **Generate** on the server, not upload."
+        "Uploading 200 MB–1 GB is **slow** (depends on your internet **upload** speed, not download). "
+        "On Cloud, prefer **Generate** here so no big upload. "
+        "You can also gzip the CSV on your PC and upload `.gz` in **Upload & Scan** to save time."
     )
     TEST_CASES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -480,13 +518,19 @@ def render_live_monitoring(pipe: Any) -> None:
         use_demo = False
 
     schema_up = None if use_demo else st.file_uploader(
-        "Upload a CSV to infer schema for simulation", type=["csv"], key="schema"
+        "Upload CSV or GZIP for schema (only first rows are read)",
+        type=["csv", "gz"],
+        key="schema",
     )
     if not use_demo and schema_up is None:
         st.warning("Upload any CSV (same columns as your training data) to start simulation.")
         return
 
-    schema_df = (demo_df if use_demo else pd.read_csv(schema_up)).head(500)  # type: ignore[arg-type]
+    schema_df = (
+        demo_df
+        if use_demo
+        else _read_streamlit_uploaded_csv(schema_up, nrows=5000)  # type: ignore[arg-type]
+    ).head(500)
     placeholder = st.empty()
     chart_placeholder = st.empty()
 
