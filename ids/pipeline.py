@@ -197,3 +197,98 @@ def predict_df(
         out["attack_probability"] = proba
     return out
 
+
+# Use when uploaded CSV is hundreds of MB–1+ GB: avoid holding the whole file in memory at once.
+LARGE_CSV_DEFAULT_CHUNK = 200_000
+
+_STREAM_COMPRESSION = {".gz": "gzip"}
+
+
+def _read_csv_kwargs_for_name(name: str) -> dict:
+    n = (name or "").lower()
+    for suf, c in _STREAM_COMPRESSION.items():
+        if n.endswith(suf):
+            return {"compression": c}
+    return {}
+
+
+def predict_from_uploaded_csv_in_chunks(
+    pipeline: Any,
+    file_obj: Any,
+    *,
+    label_col: Optional[str] = None,
+    chunksize: int = LARGE_CSV_DEFAULT_CHUNK,
+) -> tuple[dict, str, pd.DataFrame, Optional[str]]:
+    """
+    Read CSV in chunks, predict per chunk, append results to a temp file.
+
+    Returns
+    -------
+    summary : dict
+        ``rows``, ``attack``, ``normal``, optional label stats
+    out_path : str
+        Path to full results CSV (caller should ``os.remove`` when done, if desired).
+    preview : DataFrame
+        A few hundred rows to display (head + more from first chunks).
+    err : optional str
+        Set if a non-fatal issue occurred
+    """
+    import os
+    import tempfile
+
+    name = str(getattr(file_obj, "name", "") or "")
+
+    tfp = tempfile.NamedTemporaryFile(
+        delete=False, prefix="ids_pred_", suffix=".csv", mode="w", encoding="utf-8", newline=""
+    )
+    out_path = tfp.name
+    tfp.close()
+
+    kwargs = {"chunksize": int(chunksize), "low_memory": False, **_read_csv_kwargs_for_name(name)}
+
+    total = 0
+    attack = 0
+    preview_rows: list[pd.DataFrame] = []
+    max_preview = 1_200
+    n_preview = 0
+    first_chunk = True
+
+    reader = pd.read_csv(file_obj, **kwargs)
+    for chunk in reader:
+        if not isinstance(chunk, pd.DataFrame) or len(chunk) == 0:
+            break
+        out = predict_df(pipeline, chunk, label_col=label_col)
+        t = len(out)
+        total += t
+        attack += int((out["prediction"] == "attack").sum())
+        if first_chunk:
+            out.to_csv(out_path, index=False, mode="w", header=True)
+            first_chunk = False
+        else:
+            out.to_csv(out_path, index=False, mode="a", header=False)
+        if n_preview < max_preview:
+            take = min(len(out), max_preview - n_preview)
+            if take:
+                preview_rows.append(out.head(take))
+                n_preview += take
+    normal = int(total) - int(attack)
+    if preview_rows:
+        prev = pd.concat(preview_rows, ignore_index=True)
+    else:
+        prev = pd.DataFrame()
+    err = None
+    if first_chunk:
+        err = "No rows read from the file."
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        return ({"rows": 0, "attack": 0, "normal": 0, "result_path": ""}, "", prev, err)
+    summary = {
+        "rows": int(total),
+        "attack": int(attack),
+        "normal": int(normal),
+        "result_path": out_path,
+    }
+    return summary, out_path, prev, err
+

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -20,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ids.live import scapy_sniff_available, simulate_stream
-from ids.pipeline import predict_df
+from ids.pipeline import predict_df, predict_from_uploaded_csv_in_chunks
 from ids.reporting import build_ids_report_pdf, load_metrics_json
 from ids.user_store import env_bootstrap_exists, sign_up, verify_user
 
@@ -31,6 +33,10 @@ APP_TITLE = "ML-based Intrusion Detection System (IDS)"
 TEST_CASES_DIR = PROJECT_ROOT / "data" / "test_cases"
 # Must match .streamlit/config.toml [server] maxUploadSize (MB) for local/self-host
 MAX_UPLOAD_MB = 2048
+# Entire-file scan above this size uses chunked read + predict (supports ~1 GB uploads)
+LARGE_UPLOAD_BYTES = 50 * 1024 * 1024
+# In-browser download cap (results CSV); if larger we gzip or only offer sample
+MAX_DOWNLOAD_RESULT_BYTES = 100 * 1024 * 1024
 # Streamlit Community Cloud may cap lower — large files: generate on server, don’t upload
 BENCHMARK_FILES: list[tuple[str, str, int]] = [
     ("~10 KB", "test_10kb.csv", 10 * 1024),
@@ -292,14 +298,199 @@ def _read_streamlit_uploaded_csv(up: Any, *, nrows: Optional[int] = None) -> pd.
     return pd.read_csv(up, nrows=nrows, low_memory=False)
 
 
+def _uploaded_file_size_bytes(up: Any) -> int:
+    s = getattr(up, "size", None)
+    if isinstance(s, (int, float)) and s > 0:
+        return int(s)
+    try:
+        up.seek(0, 2)
+        n = int(up.tell())
+        up.seek(0)
+        return n
+    except Exception:
+        return 0
+
+
+def _preview_upload_nrows(up: Any, n: int = 100) -> pd.DataFrame:
+    up.seek(0)
+    name = (getattr(up, "name", "") or "").lower()
+    if name.endswith(".gz"):
+        return pd.read_csv(up, compression="gzip", nrows=n, low_memory=False)
+    return pd.read_csv(up, nrows=n, low_memory=False)
+
+
+def _write_scan_result_ui(out: pd.DataFrame, *, use_chunked: bool) -> None:
+    _ = use_chunked
+    st.subheader("Results (first rows)")
+    st.dataframe(out.head(200), use_container_width=True)
+
+    counts = out["prediction"].value_counts().reset_index()
+    counts.columns = ["prediction", "count"]
+    fig = px.bar(counts, x="prediction", y="count", title="Predicted Traffic Distribution")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Summary")
+    total = int(len(out))
+    attacks = int((out["prediction"] == "attack").sum())
+    normals = total - attacks
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total rows", f"{total:,}")
+    c2.metric("Normal", f"{normals:,}")
+    c3.metric("Attack", f"{attacks:,}")
+
+    if "label" in out.columns:
+        try:
+            y_true = out["label"].astype(str).str.lower().map({"normal": 0, "attack": 1})
+            y_pred = out["prediction"].astype(str).str.lower().map({"normal": 0, "attack": 1})
+            if y_true.notna().all() and y_pred.notna().all():
+                cm_local = confusion_matrix(y_true, y_pred)
+                st.session_state["last_scan_confusion"] = cm_local.tolist()
+                cm_df = pd.DataFrame(
+                    cm_local,
+                    index=["Actual Normal", "Actual Attack"],
+                    columns=["Pred Normal", "Pred Attack"],
+                )
+                fig_cm = px.imshow(cm_df, text_auto=True, title="Confusion Matrix (if labels present)")
+                st.plotly_chart(fig_cm, use_container_width=True)
+        except Exception:
+            pass
+
+    if "attack_probability" in out.columns:
+        fig2 = px.histogram(
+            out,
+            x="attack_probability",
+            nbins=40,
+            title="Attack probability distribution",
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    st.download_button(
+        "Download results CSV",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name="ids_results.csv",
+        mime="text/csv",
+    )
+
+    st.session_state["last_scan_summary"] = {
+        "rows": int(len(out)),
+        "normal": int((out["prediction"] == "normal").sum()),
+        "attack": int((out["prediction"] == "attack").sum()),
+        "head_rows": out.head(15).to_dict(orient="records"),
+        "has_labels": bool("label" in out.columns),
+    }
+
+
+def _write_scan_result_chunked_ui(
+    summary: dict, prev: pd.DataFrame, tpath: str, lcol: Optional[str]
+) -> None:
+    _ = lcol
+    st.subheader("Results (preview sample of rows + full scan counts)")
+    st.caption(
+        "**Every row in your file was scanned.** The table and charts below use the **first ~1,200** result rows for display only."
+    )
+    total = int(summary.get("rows", 0))
+    if total <= 0:
+        st.error("No rows were scanned.")
+        return
+    if prev is not None and not prev.empty:
+        st.dataframe(prev.head(200), use_container_width=True)
+    else:
+        st.warning("No preview table (inner chunks empty); see totals below.")
+
+    attacks = int(summary.get("attack", 0))
+    normals = int(summary.get("normal", 0))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total rows (full file)", f"{total:,}")
+    c2.metric("Normal", f"{normals:,}")
+    c3.metric("Attack", f"{attacks:,}")
+
+    if not prev.empty:
+        pc = prev["prediction"].value_counts().reset_index()
+        pc.columns = ["prediction", "count"]
+        fig = px.bar(
+            pc, x="prediction", y="count", title="Sample: predicted class counts (first result rows only)"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    if not prev.empty and "label" in prev.columns:
+        try:
+            y_true = prev["label"].astype(str).str.lower().map({"normal": 0, "attack": 1})
+            y_pred = prev["prediction"].astype(str).str.lower().map({"normal": 0, "attack": 1})
+            if y_true.notna().all() and y_pred.notna().all():
+                cm_local = confusion_matrix(y_true, y_pred)
+                cm_df = pd.DataFrame(
+                    cm_local,
+                    index=["Actual Normal", "Actual Attack"],
+                    columns=["Pred Normal", "Pred Attack"],
+                )
+                st.caption("Confusion matrix: **sample rows only** (not full 1GB).")
+                st.plotly_chart(
+                    px.imshow(cm_df, text_auto=True, title="Confusion matrix (preview sample)"),
+                    use_container_width=True,
+                )
+        except Exception:
+            pass
+
+    if not prev.empty and "attack_probability" in prev.columns:
+        st.plotly_chart(
+            px.histogram(
+                prev,
+                x="attack_probability",
+                nbins=40,
+                title="Attack probability (preview sample only)",
+            ),
+            use_container_width=True,
+        )
+
+    if tpath and os.path.isfile(tpath):
+        rsize = os.path.getsize(tpath)
+        if rsize <= MAX_DOWNLOAD_RESULT_BYTES:
+            st.download_button(
+                "Download full results CSV",
+                data=Path(tpath).read_bytes(),
+                file_name="ids_results.csv",
+                mime="text/csv",
+            )
+        else:
+            st.caption("Full results CSV is large; offering **gzip** download (smaller than raw CSV).")
+            tgz = Path(f"{tpath}.for_download.gz")
+            if tgz.is_file():
+                tgz.unlink()
+            with open(tpath, "rb") as fi, gzip.open(tgz, "wb", compresslevel=6) as go:
+                shutil.copyfileobj(fi, go, length=4 * 1024 * 1024)
+            gzs = tgz.stat().st_size
+            st.session_state["ids_pred_gz_path"] = str(tgz)
+            cap = min(MAX_DOWNLOAD_RESULT_BYTES * 2, 200 * 1024 * 1024)
+            if gzs <= cap:
+                st.download_button(
+                    "Download full results (gzip)",
+                    data=tgz.read_bytes(),
+                    file_name="ids_results.csv.gz",
+                    mime="application/gzip",
+                )
+            else:
+                st.warning(
+                    "Even compressed, the file is very large for the browser. "
+                    "Use **max rows** for a smaller run, or self-host. On-screen **metrics** are for the full scan."
+                )
+
+    st.session_state["last_scan_summary"] = {
+        "rows": total,
+        "normal": normals,
+        "attack": attacks,
+        "head_rows": prev.head(15).to_dict(orient="records") if not prev.empty else [],
+        "has_labels": bool("label" in prev.columns) if not prev.empty else False,
+    }
+
+
 def render_upload_and_scan(pipe: Any) -> None:
     st.header("Upload Dataset to Scan Attacks")
     st.info(
-        "**Why 200 MB / 1 GB uploads feel slow:** your **upload speed** (Wi‑Fi / ISP) sends every byte to the server — "
-        "often **10–40+ minutes** for hundreds of MB. This is normal. "
-        "**Faster options:** (1) export as **`.csv.gz`** and upload that (often **5–10× smaller**); "
-        "(2) set **max rows** below to test on a subset; "
-        "(3) on **Test case files**, use **Generate** on the server instead of uploading."
+        "**~1 GB uploads are supported** after the file is fully uploaded. "
+        "The app will **stream the CSV in chunks** (no need to load 1 GB into RAM at once). "
+        "Upload time still depends on your **internet upload speed** (often 20–60+ min for 1 GB). "
+        "Use **`.csv.gz`** for a smaller upload, or set **max rows** for a quick test. "
+        "Charts for huge runs use a **preview sample**; metrics use **all rows**."
     )
     demo_df = _load_default_demo_df()
     if demo_df is not None:
@@ -312,11 +503,11 @@ def render_upload_and_scan(pipe: Any) -> None:
     if not use_demo:
         max_rows = int(
             st.number_input(
-                "Max rows to load (0 = whole file — large files use lots of RAM/time)",
+                "Max rows to load (0 = **entire file** — 200MB–1GB uses chunked mode automatically)",
                 min_value=0,
                 value=0,
                 step=10_000,
-                help="Non-zero = only first N rows (good for quick tests on huge CSVs).",
+                help="Use 0 to scan 100% of the uploaded data. Set e.g. 100000 to test faster.",
             )
         )
     nrows: Optional[int] = None if max_rows <= 0 else max_rows
@@ -325,83 +516,87 @@ def render_upload_and_scan(pipe: Any) -> None:
         None
         if use_demo
         else st.file_uploader(
-            "Upload CSV or GZIP (.csv / .csv.gz)",
+            "Upload CSV or GZIP (.csv / .csv.gz) — up to 2 GB in this app config",
             type=["csv", "gz"],
-            help="Gzip compress on your PC first if the upload is too slow.",
+            help="Gzip on your PC first to upload faster. Max size: see maxUploadSize in .streamlit/config.toml.",
         )
     )
     label_col = st.text_input("Label column (optional, will be ignored)", value="")
+    lcol: Optional[str] = label_col.strip() or None
 
     if not use_demo and up is None:
         st.caption("Upload a CSV similar to NSL-KDD / CICIDS2017 feature tables.")
         return
 
-    df = demo_df if use_demo else _read_streamlit_uploaded_csv(up, nrows=nrows)  # type: ignore[arg-type]
-    st.subheader("Preview")
-    st.dataframe(df.head(50), use_container_width=True)
-
-    if st.button("Run Detection"):
-        out = predict_df(pipe, df, label_col=(label_col.strip() or None))
-
-        st.subheader("Results (first rows)")
-        st.dataframe(out.head(200), use_container_width=True)
-
-        counts = out["prediction"].value_counts().reset_index()
-        counts.columns = ["prediction", "count"]
-        fig = px.bar(counts, x="prediction", y="count", title="Predicted Traffic Distribution")
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Summary")
-        total = int(len(out))
-        attacks = int((out["prediction"] == "attack").sum())
-        normals = total - attacks
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total rows", f"{total}")
-        c2.metric("Normal", f"{normals}")
-        c3.metric("Attack", f"{attacks}")
-
-        if "label" in out.columns:
-            try:
-                y_true = out["label"].astype(str).str.lower().map({"normal": 0, "attack": 1})
-                y_pred = out["prediction"].astype(str).str.lower().map({"normal": 0, "attack": 1})
-                if y_true.notna().all() and y_pred.notna().all():
-                    cm_local = confusion_matrix(y_true, y_pred)
-                    st.session_state["last_scan_confusion"] = cm_local.tolist()
-                    cm_df = pd.DataFrame(
-                        cm_local,
-                        index=["Actual Normal", "Actual Attack"],
-                        columns=["Pred Normal", "Pred Attack"],
-                    )
-                    fig_cm = px.imshow(cm_df, text_auto=True, title="Confusion Matrix (if labels present)")
-                    st.plotly_chart(fig_cm, use_container_width=True)
-            except Exception:
-                pass
-
-        if "attack_probability" in out.columns:
-            fig2 = px.histogram(
-                out,
-                x="attack_probability",
-                nbins=40,
-                title="Attack probability distribution",
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
-        csv_bytes = out.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download results CSV",
-            data=csv_bytes,
-            file_name="ids_results.csv",
-            mime="text/csv",
+    st.subheader("Preview (first 100 rows)")
+    if use_demo and demo_df is not None:
+        st.dataframe(demo_df.head(100), use_container_width=True)
+        st.caption("Demo set — first 100 rows.")
+    elif up is not None:
+        prev = _preview_upload_nrows(up, 100)
+        sz = _uploaded_file_size_bytes(up)
+        st.dataframe(prev, use_container_width=True)
+        st.caption(
+            f"Uploaded size ≈ **{_fmt_file_size(sz)}**. Showing first 100 rows only. "
+            "If your upload is 1 GB, wait until the browser upload finishes, then run detection."
         )
+    else:
+        st.warning("Turn off **Use demo** and upload a CSV, or add `data/test.csv` for demo mode.")
 
-        # Save summary for PDF report
-        st.session_state["last_scan_summary"] = {
-            "rows": int(len(out)),
-            "normal": int((out["prediction"] == "normal").sum()),
-            "attack": int((out["prediction"] == "attack").sum()),
-            "head_rows": out.head(15).to_dict(orient="records"),
-            "has_labels": bool("label" in out.columns),
-        }
+    if not st.button("Run Detection", type="primary"):
+        return
+
+    if use_demo and demo_df is None:
+        st.error("Demo dataset not found. Place `data/test.csv` or switch off the demo toggle and upload a file.")
+        return
+
+    if use_demo and demo_df is not None:
+        with st.spinner("Running detection on full demo data…"):
+            out = predict_df(pipe, demo_df, label_col=lcol)
+        _write_scan_result_ui(out, use_chunked=False)
+
+    elif up is not None and nrows is not None and nrows > 0:
+        up.seek(0)
+        with st.spinner(f"Loading first {nrows:,} rows…"):
+            df = _read_streamlit_uploaded_csv(up, nrows=nrows)
+        out = predict_df(pipe, df, label_col=lcol)
+        _write_scan_result_ui(out, use_chunked=False)
+
+    elif up is not None:
+        up.seek(0)
+        sz2 = _uploaded_file_size_bytes(up)
+        if sz2 > LARGE_UPLOAD_BYTES and (nrows is None or nrows <= 0):
+            for _k in ("ids_pred_temp_csv", "ids_pred_gz_path"):
+                _p = st.session_state.get(_k)
+                if _p and isinstance(_p, str) and os.path.isfile(_p):
+                    try:
+                        os.remove(_p)
+                    except OSError:
+                        pass
+                st.session_state.pop(_k, None)
+            st.success(
+                f"**Large file mode** (~{_fmt_file_size(sz2)}): processing in **chunks** (safe for 1 GB+). "
+                "This can take many minutes; do not close the tab."
+            )
+            up.seek(0)
+            with st.status("Scanning file in chunks (full dataset)…", expanded=True) as status:
+                summary, tpath, prev, err = predict_from_uploaded_csv_in_chunks(
+                    pipe, up, label_col=lcol, chunksize=200_000
+                )
+                if err:
+                    status.update(label="Scan failed", state="error")
+                    st.error(err)
+                    return
+                status.update(label="Scan complete", state="complete")
+            if tpath and os.path.isfile(tpath):
+                st.session_state["ids_pred_temp_csv"] = tpath
+            _write_scan_result_chunked_ui(summary, prev, tpath, lcol)
+        else:
+            with st.spinner("Loading file…"):
+                up.seek(0)
+                df = _read_streamlit_uploaded_csv(up, nrows=None)
+            out = predict_df(pipe, df, label_col=lcol)
+            _write_scan_result_ui(out, use_chunked=False)
 
 
 def render_test_case_library() -> None:
